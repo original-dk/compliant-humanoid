@@ -43,30 +43,50 @@ def train(args):
     clip, features = load_clip(args.clip, model)
     net = Controller(33)
     optimizer = torch.optim.Adam(net.parameters(), lr=.001)
-    for iteration in range(args.iterations):
-        start = rng.integers(max(1, len(clip)-24))
+    if args.init:
+        net.load_state_dict(torch.load(args.init, weights_only=True, map_location=gs.device))
+    else:
+        with torch.no_grad():
+            net.log_std.fill_(np.log(.25))
+
+    def optimize(records, bootstrap, terminal):
+        obs, act, logp, values, rewards, wrench, balance = zip(*records)
+        v = tensor(values)
+        end = torch.zeros_like(v, dtype=torch.bool)
+        end[-1] = terminal
+        adv, ret = advantages(tensor(rewards), v, torch.cat((v[1:], v.new_tensor([bootstrap]))), end, end)
+        batch = [torch.stack(xs) for xs in zip(*obs)]
+        for _ in range(5):
+            for idx in torch.randperm(len(v)).chunk(min(4, len(v))):
+                loss = update(net, optimizer, [x[idx] for x in batch], torch.stack(act)[idx],
+                              torch.stack(logp)[idx], adv[idx], ret[idx], torch.stack(wrench)[idx],
+                              torch.stack(balance)[idx])
+        return loss
+
+    records = []
+    iteration = 0
+    while iteration < args.iterations:
+        start = rng.integers(max(1, len(clip)-150+1))
         row = clip[start]
         ref = np.r_[row[:3], row[6], row[3:6], row[7:]]
         data.qpos[:] = ref
         mj.mj_forward(model, data)
         gravity = np.array([0., 0., -1.])
         k = np.exp(rng.uniform(np.log(10), np.log(970)))
-        force = rng.uniform(-5., 5., 3)
-        target = tensor(adapt(model, ref, force, k)[7:])
+        force = rng.uniform(-args.force, args.force, 3)
         initial = robot.get_qpos().clone()
         initial[:7] = tensor(ref[:7])
         initial[coords] = tensor(ref[7:])
         robot.set_qpos(initial, zero_velocity=True)
         previous = torch.zeros(29)
         memory = None
-        records = []
 
         stiffness = torch.full((10, 1), float(np.log(k)))
-        for step in range(min(24, len(clip)-start)):
-            frame = start + step
+        for step in range(min(150, len(clip)-start) + 1):
+            frame = min(start + step, len(clip)-1)
             row = clip[frame]
             ref = np.r_[row[:3], row[6], row[3:6], row[7:]]
-            target = tensor(adapt(model, ref, force, k)[7:])
+            target = tensor(adapt(model, ref, force, k)[7:] if args.force else ref[7:])
             ref_history = tensor(features[np.maximum(0, frame + np.arange(-9, 1))])
             future = tensor(features[np.minimum(len(clip)-1, frame + 2*np.arange(5))])
             qpos = robot.get_qpos().cpu().numpy()
@@ -91,6 +111,23 @@ def train(args):
             obs = [memory, ref_history, stiffness, future, torch.cat((wrench, balance))]
             with torch.no_grad():
                 dist, value, _, _ = net(*(x[None] for x in obs))
+            if len(records) == 24:
+                loss = optimize(records, value.item(), False)
+                iteration += 1
+                print(f"update={iteration} episode_steps={step} loss={loss:.3f}", flush=True)
+                records.clear()
+                if iteration >= args.iterations:
+                    break
+                with torch.no_grad():
+                    dist, value, _, _ = net(*(x[None] for x in obs))
+            if step == min(150, len(clip)-start):
+                if records:
+                    # Time limit: bootstrap before resetting the simulator.
+                    optimize(records, value.item(), False)
+                    iteration += 1
+                    records.clear()
+                break
+            with torch.no_grad():
                 action = dist.sample()[0]
                 logp = dist.log_prob(action).sum()
             robot.control_dofs_position(.5 * action + tensor(model.qpos0[7:]), indices)
@@ -100,22 +137,17 @@ def train(args):
             error = (robot.get_dofs_position(indices)-target).square().mean()
             reward = 2 * torch.exp(-error/.09) - .1 * (action-previous).square().mean()
             fallen = robot.get_pos()[2].item() < .35
+            height_error = robot.get_pos()[2] - row[2]
+            up = Rotation.from_quat(robot.get_quat().cpu().numpy()[[1,2,3,0]]).as_matrix()[2,2]
+            reward += torch.exp(-height_error.square()/.01) + float(up) - 5 * int(fallen)
             records.append((obs, action, logp, value.item(), reward.item(), wrench, balance))
             previous = action
             if fallen:
+                loss = optimize(records, 0., True)
+                iteration += 1
+                print(f'update={iteration} fell_at={(step+1)/50:.2f}s loss={loss:.3f}', flush=True)
+                records.clear()
                 break
-        obs, act, logp, values, rewards, wrench, balance = zip(*records)
-        v = tensor(values)
-        end = torch.zeros_like(v, dtype=torch.bool)
-        end[-1] = True
-        adv, ret = advantages(tensor(rewards), v, torch.cat((v[1:], v.new_zeros(1))), end, end)
-        batch = [torch.stack(xs) for xs in zip(*obs)]
-        for _ in range(5):
-            for idx in torch.randperm(len(v)).chunk(min(4, len(v))):
-                loss = update(net, optimizer, [x[idx] for x in batch], torch.stack(act)[idx],
-                              torch.stack(logp)[idx], adv[idx], ret[idx], torch.stack(wrench)[idx],
-                              torch.stack(balance)[idx])
-        print(iteration, len(v), np.mean(rewards), loss, flush=True)
     torch.save(net.state_dict(), args.output)
 
 
@@ -126,6 +158,8 @@ def main():
     p.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--output", default="standing.pt")
+    p.add_argument("--force", type=float, default=5., help="Per-axis wrist load bound in N; 0 disables loads")
+    p.add_argument("--init", help="Initialize weights from an earlier training stage")
     train(p.parse_args())
 
 

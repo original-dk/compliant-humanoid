@@ -18,7 +18,8 @@ from .motion import load_clip
 def run(args):
     device = torch.device(args.device)
     policy = Controller(33)
-    policy.load_state_dict(torch.load(args.policy, map_location="cpu", weights_only=True))
+    if args.policy:
+        policy.load_state_dict(torch.load(args.policy, map_location="cpu", weights_only=True))
     policy.to(device).eval()
     gs.init(backend=gs.cuda if device.type == "cuda" else gs.cpu, seed=1)
     model = mj.MjModel.from_xml_path(str(XML))
@@ -59,7 +60,8 @@ def run(args):
             future = tensor(reference[np.minimum(len(clip)-1, frame+2*np.arange(5))])
             dist, _, _, _ = policy(memory[None], past[None], stiffness, future[None])
             previous = dist.mean[0]
-            robot.control_dofs_position(tensor(model.qpos0[7:]) + .5*previous, indices)
+            target = tensor(clip[frame, 7:]) if args.pd else tensor(model.qpos0[7:]) + .5*previous
+            robot.control_dofs_position(target, indices)
             force = args.force if args.start <= t < args.start + args.duration else np.zeros(3)
             for _ in range(4):
                 link.apply_external_force(np.asarray(force))
@@ -74,7 +76,9 @@ def run(args):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--policy", type=Path, required=True)
+    mode = p.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--policy", type=Path)
+    mode.add_argument("--pd", action="store_true", help="Track reference joint angles directly")
     p.add_argument("--clip", default=CLIP)
     p.add_argument("--device", choices=["cpu", "cuda"], default="cuda")
     p.add_argument("--viewer", action="store_true")
