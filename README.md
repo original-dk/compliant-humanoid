@@ -23,3 +23,9 @@ uv run python -m unittest discover -s tests
 策略包含力、平衡和未来参考编码器、29 维动作和非对称价值网络。单轮训练包含左腕扰动、固定根姿态的 IK、关节跟踪和动作平滑奖励、GAE、PPO 和辅助估计损失。完整奖励、域随机化、长回合和论文任务评测仍未实现。
 
 G1 资源来自 Unitree Robotics，许可证位于 data/g1_description/LICENSE。walk4_subject1.csv 是 Ubisoft La Forge LAFAN1 的 G1 重定向片段，按源项目说明仅保存在本地。仓库中的 knee_bend.csv 由生成脚本独立生成。
+
+## 论文对照（附录 L，表 A5、A6）
+
+新策略的动作标准差初值为 1。动作仍为默认姿态加 0.5 倍策略输出，当前默认姿态取 MJCF qpos0。每环境采样 24 个控制步，回合最长 1500 步（50 Hz），动作结束或跌倒可提前结束。PPO 初始学习率 0.001，目标 KL 0.01，辅助参数学习率 0.0003。KL 调度的倍率、上下界为本实现选择。--init 继承已有权重，包括 log_std。
+
+奖励加入表 A5 的存活项 0.5。权重 -10 的关节限位项采用 SoftMimic 公开实现的解释：以关节行程中央 90% 为软限位，对实际关节角的越界距离求和。来源为 Improbable-AI/softmimic 的 823582557d5417c9382303ba749262afab625076 版本，StaticStand-SoftMimic/params/env.yaml 及 g1_force_control.py。该对应关系是复现假设。命令越界与实际关节越界是不同量。WBC2 专有默认姿态、逐关节 PD、表 A5 中另两项位置和力矩限位惩罚的精确定义仍待核实。训练目前仍采用项目原有统一 PD，完整表 A5 和域随机化尚未实现。

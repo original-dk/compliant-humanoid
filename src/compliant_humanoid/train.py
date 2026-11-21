@@ -46,12 +46,20 @@ def train(args):
     robot.set_dofs_kv(np.full(29, 3.), indices)
     clip, features = load_clip(args.clip, model)
     net = Controller(33)
-    optimizer = torch.optim.Adam(net.parameters(), lr=args.lr)
+    actor_critic, auxiliary = [], []
+    for name, parameter in net.named_parameters():
+        group = auxiliary if name.startswith(("force_", "balance", "wrench")) else actor_critic
+        group.append(parameter)
+    optimizer = torch.optim.Adam([{"params": actor_critic, "lr": args.lr},
+                                  {"params": auxiliary, "lr": 3e-4}])
+    # SoftMimic StaticStand uses Isaac Lab joint_pos_limits, with a 0.9 soft range.
+    ranges = tensor(model.jnt_range[1:])
+    center = ranges.mean(dim=1)
+    half = .45 * (ranges[:, 1] - ranges[:, 0])
+    soft_lower, soft_upper = center - half, center + half
     if args.init:
         net.load_state_dict(torch.load(args.init, weights_only=True, map_location=gs.device))
-    else:
-        with torch.no_grad():
-            net.log_std.fill_(np.log(.25))
+
 
     def optimize(records, bootstrap, terminal):
         obs, act, logp, values, rewards, wrench, balance = zip(*records)
@@ -60,8 +68,21 @@ def train(args):
         end[-1] = terminal
         adv, ret = advantages(tensor(rewards), v, torch.cat((v[1:], v.new_tensor([bootstrap]))), end, end)
         batch = [torch.stack(xs) for xs in zip(*obs)]
+        with torch.no_grad():
+            old_policy = net(*batch)[0]
+            old_mean, old_std = old_policy.mean.clone(), old_policy.stddev.clone()
         for _ in range(5):
             for idx in torch.randperm(len(v)).chunk(min(4, len(v))):
+                with torch.no_grad():
+                    current = net(*(x[idx] for x in batch))[0]
+                    original = torch.distributions.Normal(old_mean[idx], old_std[idx])
+                    kl = torch.distributions.kl_divergence(original, current).sum(-1).mean().item()
+                    # Multipliers and bounds are scheduler choices; Table A6 specifies target KL.
+                    group = optimizer.param_groups[0]
+                    if kl > .02:
+                        group["lr"] = max(1e-5, group["lr"] / 1.5)
+                    elif 0 < kl < .005:
+                        group["lr"] = min(.01, group["lr"] * 1.5)
                 loss = update(net, optimizer, [x[idx] for x in batch], torch.stack(act)[idx],
                               torch.stack(logp)[idx], adv[idx], ret[idx], torch.stack(wrench)[idx],
                               torch.stack(balance)[idx])
@@ -70,7 +91,7 @@ def train(args):
     records = []
     iteration = 0
     while iteration < args.iterations:
-        start = rng.integers(max(1, len(clip)-150+1))
+        start = rng.integers(max(1, len(clip)-1500+1))
         row = clip[start]
         ref = np.r_[row[:3], row[6], row[3:6], row[7:]]
         data.qpos[:] = ref
@@ -86,7 +107,7 @@ def train(args):
         memory = None
 
         stiffness = torch.full((10, 1), float(np.log(k)))
-        for step in range(min(150, len(clip)-start) + 1):
+        for step in range(min(1500, len(clip)-start) + 1):
             frame = min(start + step, len(clip)-1)
             row = clip[frame]
             ref = np.r_[row[:3], row[6], row[3:6], row[7:]]
@@ -129,7 +150,7 @@ def train(args):
                     break
                 with torch.no_grad():
                     dist, value, _, _ = net(*(x[None] for x in obs))
-            if step == min(150, len(clip)-start):
+            if step == min(1500, len(clip)-start):
                 if records:
                     # Time limit: bootstrap before resetting the simulator.
                     optimize(records, value.item(), False)
@@ -143,8 +164,11 @@ def train(args):
             for _ in range(4):
                 wrist.apply_external_force(force)
                 scene.step()
-            error = (robot.get_dofs_position(indices)-target).square().mean()
+            measured = robot.get_dofs_position(indices)
+            limit_error = ((soft_lower - measured).relu() + (measured - soft_upper).relu()).sum()
+            error = (measured-target).square().mean()
             reward = 2 * torch.exp(-error/.09) - .1 * (action-previous).square().mean()
+            reward += .5 - 10.0 * limit_error
             fallen = robot.get_pos()[2].item() < .35
             height_error = robot.get_pos()[2] - row[2]
             up = Rotation.from_quat(robot.get_quat().cpu().numpy()[[1,2,3,0]]).as_matrix()[2,2]
@@ -167,7 +191,7 @@ def main():
     p.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--output", default="standing.pt")
-    p.add_argument("--lr", type=float, default=0.0001)
+    p.add_argument("--lr", type=float, default=0.001)
     p.add_argument("--force", type=float, default=5., help="Per-axis wrist load bound in N; 0 disables loads")
     p.add_argument("--init", help="Initialize weights from an earlier training stage")
     train(p.parse_args())
