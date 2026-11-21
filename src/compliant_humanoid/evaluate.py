@@ -24,7 +24,11 @@ def run(args):
     gs.init(backend=gs.cuda if device.type == "cuda" else gs.cpu, seed=1)
     model = mj.MjModel.from_xml_path(str(XML))
     clip, reference = load_clip(args.clip, model)
-    scene = gs.Scene(sim_options=gs.options.SimOptions(dt=.005), show_viewer=args.viewer)
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=.005),
+        profiling_options=gs.options.ProfilingOptions(show_FPS=False),
+        show_viewer=args.viewer,
+    )
     scene.add_entity(gs.morphs.Plane())
     robot = scene.add_entity(gs.morphs.MJCF(file=str(XML), align=False))
     scene.build()

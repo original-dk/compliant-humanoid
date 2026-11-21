@@ -11,7 +11,11 @@ def main():
     parser.add_argument("--viewer", action="store_true")
     args = parser.parse_args()
     gs.init()
-    scene = gs.Scene(sim_options=gs.options.SimOptions(dt=0.005), show_viewer=args.viewer)
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=0.005),
+        profiling_options=gs.options.ProfilingOptions(show_FPS=False),
+        show_viewer=args.viewer,
+    )
     scene.add_entity(gs.morphs.Plane())
     robot = scene.add_entity(gs.morphs.MJCF(file=str(args.xml.resolve(strict=True))))
     scene.build()

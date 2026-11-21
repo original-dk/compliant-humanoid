@@ -26,7 +26,11 @@ def train(args):
     if gs.device.type != args.device:
         raise RuntimeError(f"Genesis initialized on {gs.device}, requested {args.device}")
     torch.set_default_device(gs.device)
-    scene = gs.Scene(sim_options=gs.options.SimOptions(dt=.005), show_viewer=False)
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=.005),
+        profiling_options=gs.options.ProfilingOptions(show_FPS=False),
+        show_viewer=False,
+    )
     scene.add_entity(gs.morphs.Plane())
     robot = scene.add_entity(gs.morphs.MJCF(file=str(XML), align=False))
     scene.build()
