@@ -1,0 +1,23 @@
+[project]
+name = "compliant-humanoid"
+version = "0.1.0"
+requires-python = ">=3.11,<3.13"
+dependencies = ["genesis-world", "numpy", "torch", "scipy", "mujoco"]
+
+[build-system]
+requires = ["uv_build>=0.8,<0.12"]
+build-backend = "uv_build"
+
+[project.scripts]
+compliant-humanoid = "compliant_humanoid.train:main"
+
+[project.optional-dependencies]
+cuda = ["torch==2.9.0"]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128", extra = "cuda" }]
