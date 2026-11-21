@@ -59,8 +59,8 @@ def run(args):
     if args.headless:
         window = nullcontext(None)
     else:
-        import mujoco.viewer as viewer
-        window = viewer.launch_passive(model, data, key_callback=events.put)
+        from .drag_viewer import DragViewer
+        window = DragViewer(model, data, events.put)
     with window as view:
         if view:
             view.cam.lookat[:] = [0, 0, .8]
@@ -77,14 +77,6 @@ def run(args):
                 key = events.get()
                 if key == ord("R"):
                     reset = True
-                elif key == ord("T") and not reset:
-                    mode = "hold" if mode == "teach" else "teach"
-                    arm_target = torch.tensor(np.clip(data.qpos[7:][arm_ids], *limits.T),
-                                              dtype=torch.float32)
-                    if mode == "teach":
-                        stiffness = 50.
-                    else:
-                        stiffness_goal = 400.
                 elif key == ord("F"):
                     pulse = 25
                 elif key in (ord("1"), ord("2"), 321, 322):
@@ -105,6 +97,16 @@ def run(args):
                 mode = "play"
                 arm_history = None
                 reset = False
+            if view:
+                view.sync()
+                if view.perturb.active and mode != "teach":
+                    mode = "teach"
+                    stiffness = 50.
+                elif not view.perturb.active and mode == "teach":
+                    mode = "hold"
+                    arm_target = torch.tensor(np.clip(data.qpos[7:][arm_ids], *limits.T),
+                                              dtype=torch.float32)
+                    stiffness_goal = 400.
             orientation = Rotation.from_quat(data.qpos[[4, 5, 6, 3]])
             # Floating-joint angular velocity is already in the local body frame.
             prop = torch.cat((torch.tensor(np.r_[data.qvel[3:6],
@@ -134,9 +136,8 @@ def run(args):
                 pulse = 25
             if view:
                 view.set_texts((mj.mjtFontScale.mjFONTSCALE_100, mj.mjtGridPos.mjGRID_TOPRIGHT,
-                                "Stiffness command (N/m)\nLeft wrist test force (N)\nLeft arm [T]",
+                                "Stiffness command (N/m)\nLeft wrist test force (N)\nLeft arm [drag]",
                                 f"{stiffness:.0f}\n{5 if pulse else 0}\n{mode}"))
-                view.sync()
             if pulse:
                 data.xfrc_applied[wrist, 0] += 5
             if not np.isfinite(data.ctrl).all():
