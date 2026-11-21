@@ -42,7 +42,7 @@ def train(args):
     robot.set_dofs_kv(np.full(29, 3.), indices)
     clip, features = load_clip(args.clip, model)
     net = Controller(33)
-    optimizer = torch.optim.Adam(net.parameters(), lr=.001)
+    optimizer = torch.optim.Adam(net.parameters(), lr=args.lr)
     if args.init:
         net.load_state_dict(torch.load(args.init, weights_only=True, map_location=gs.device))
     else:
@@ -109,6 +109,11 @@ def train(args):
             wrench = tensor(np.r_[rot.inv().apply(force), np.zeros(3), np.log(k),
                                   np.zeros(6), np.log(k)])
             obs = [memory, ref_history, stiffness, future, torch.cat((wrench, balance))]
+            flags = torch.stack([torch.isfinite(x).all() for x in obs])
+            if not flags.all():
+                names = ("proprioception", "past_reference", "log_stiffness", "future_reference", "privileged")
+                invalid = [name for name, ok in zip(names, flags.tolist()) if not ok]
+                raise FloatingPointError(f"Non-finite {invalid} at update={iteration} frame={frame}")
             with torch.no_grad():
                 dist, value, _, _ = net(*(x[None] for x in obs))
             if len(records) == 24:
@@ -158,6 +163,7 @@ def main():
     p.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--output", default="standing.pt")
+    p.add_argument("--lr", type=float, default=0.0001)
     p.add_argument("--force", type=float, default=5., help="Per-axis wrist load bound in N; 0 disables loads")
     p.add_argument("--init", help="Initialize weights from an earlier training stage")
     train(p.parse_args())
