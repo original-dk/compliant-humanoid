@@ -18,11 +18,15 @@ from .motion import load_clip
 def scene_model():
     spec = mj.MjSpec.from_file(str(XML))
     spec.option.timestep = .005
+    spec.option.disableflags |= mj.mjtDisableBit.mjDSBL_AUTORESET
     spec.option.integrator = mj.mjtIntegrator.mjINT_IMPLICITFAST
     spec.worldbody.add_geom(name="ground", type=mj.mjtGeom.mjGEOM_PLANE,
                             size=[0, 0, .05], rgba=[.38, .4, .42, 1])
     for joint in spec.joints:
         if joint.type == mj.mjtJoint.mjJNT_HINGE:
+            # Genesis 1.4.5 MJCF fills unspecified rotor inertia on one-DOF links.
+            if joint.armature == 0:
+                joint.armature = .1
             servo = spec.add_actuator(name=joint.name, target=joint.name,
                                       trntype=mj.mjtTrn.mjTRN_JOINT)
             servo.set_to_position(kp=60., kv=3.)
@@ -87,8 +91,18 @@ def run(args):
             data.ctrl[:] = model.qpos0[7:] + .5*previous.numpy()
             if view:
                 view.sync()
+            if not np.isfinite(data.ctrl).all():
+                raise FloatingPointError(f"Non-finite policy target at t={data.time:.3f}s")
             for _ in range(4):
                 mj.mj_step(model, data)
+                for warning in (mj.mjtWarning.mjWARN_BADQACC, mj.mjtWarning.mjWARN_BADQVEL,
+                                mj.mjtWarning.mjWARN_BADQPOS, mj.mjtWarning.mjWARN_BADCTRL):
+                    stat = data.warning[warning]
+                    if stat.number:
+                        raise FloatingPointError(
+                            f"{warning.name} at t={data.time:.3f}s, index={stat.lastinfo}, "
+                            f"max_abs_target={np.abs(data.ctrl).max():.3f} rad"
+                        )
             elapsed += 1
             frame = min(frame + 1, len(clip)-1)
             if args.seconds and elapsed >= int(np.ceil(50*args.seconds)):
