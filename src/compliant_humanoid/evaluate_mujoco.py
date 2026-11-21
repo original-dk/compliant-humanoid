@@ -20,8 +20,13 @@ def scene_model():
     spec.option.timestep = .005
     spec.option.disableflags |= mj.mjtDisableBit.mjDSBL_AUTORESET
     spec.option.integrator = mj.mjtIntegrator.mjINT_IMPLICITFAST
+    spec.add_texture(name="floor_checker", type=mj.mjtTexture.mjTEXTURE_2D,
+                     builtin=mj.mjtBuiltin.mjBUILTIN_CHECKER, width=128, height=128,
+                     rgb1=[.32, .36, .40], rgb2=[.50, .55, .59])
+    floor = spec.add_material(name="floor_material", texrepeat=[2, 2], texuniform=True)
+    floor.textures[mj.mjtTextureRole.mjTEXROLE_RGB] = "floor_checker"
     spec.worldbody.add_geom(name="ground", type=mj.mjtGeom.mjGEOM_PLANE,
-                            size=[0, 0, .05], rgba=[.38, .4, .42, 1])
+                            size=[0, 0, .05], material="floor_material")
     for joint in spec.joints:
         if joint.type == mj.mjtJoint.mjJNT_HINGE:
             # Genesis 1.4.5 MJCF fills unspecified rotor inertia on one-DOF links.
@@ -46,6 +51,7 @@ def run(args):
     data = mj.MjData(model)
     clip, reference = load_clip(args.clip, model)
     reference = torch.as_tensor(reference, dtype=torch.float32)
+    wrist = model.body('left_wrist_yaw_link').id
     events = SimpleQueue()
     if args.headless:
         window = nullcontext(None)
@@ -59,14 +65,17 @@ def run(args):
         reset = True
         elapsed = 0
         stiffness = args.stiffness
+        pulse = 0
         while view is None or view.is_running():
             start = time.perf_counter()
             while not events.empty():
                 key = events.get()
                 if key == ord("R"):
                     reset = True
-                elif key in (ord("1"), ord("2")):
-                    stiffness = 100. if key == ord("1") else 400.
+                elif key == ord("F"):
+                    pulse = 25
+                elif key in (ord("1"), ord("2"), 321, 322):
+                    stiffness = 100. if key in (ord("1"), 321) else 400.
                     print(f"stiffness={stiffness:g} N/m", flush=True)
             if reset:
                 mj.mj_resetData(model, data)
@@ -75,6 +84,7 @@ def run(args):
                 mj.mj_forward(model, data)
                 previous = torch.zeros(29)
                 history = None
+                pulse = 0
                 frame = 0
                 reset = False
             orientation = Rotation.from_quat(data.qpos[[4, 5, 6, 3]])
@@ -89,8 +99,15 @@ def run(args):
                                     torch.full((1, 10, 1), float(np.log(stiffness))), future[None])
             previous = dist.mean[0]
             data.ctrl[:] = model.qpos0[7:] + .5*previous.numpy()
+            if args.test_pull and elapsed == 50:
+                pulse = 25
             if view:
+                view.set_texts((mj.mjtFontScale.mjFONTSCALE_100, mj.mjtGridPos.mjGRID_TOPRIGHT,
+                                "Stiffness command (N/m)\nLeft wrist test force (N)",
+                                f"{stiffness:g}\n{5 if pulse else 0}"))
                 view.sync()
+            if pulse:
+                data.xfrc_applied[wrist, 0] += 5
             if not np.isfinite(data.ctrl).all():
                 raise FloatingPointError(f"Non-finite policy target at t={data.time:.3f}s")
             for _ in range(4):
@@ -103,7 +120,13 @@ def run(args):
                             f"{warning.name} at t={data.time:.3f}s, index={stat.lastinfo}, "
                             f"max_abs_target={np.abs(data.ctrl).max():.3f} rad"
                         )
+            if pulse:
+                data.xfrc_applied[wrist, 0] -= 5
+                pulse -= 1
             elapsed += 1
+            if elapsed == 75:
+                mj.mj_forward(model, data)
+                print(f"t=1.50 wrist_x_m={data.xpos[wrist, 0]:.8f}", flush=True)
             frame = min(frame + 1, len(clip)-1)
             if args.seconds and elapsed >= int(np.ceil(50*args.seconds)):
                 break
@@ -118,6 +141,7 @@ def main():
     p.add_argument("--clip", default=CLIP)
     p.add_argument("--stiffness", type=float, default=100.)
     p.add_argument("--headless", action="store_true")
+    p.add_argument("--test-pull", action="store_true", help="Apply +5 N at left wrist from 1 to 1.5 s")
     p.add_argument("--seconds", type=float, help="Stop after this many simulated seconds")
     args = p.parse_args()
     if not np.isfinite(args.stiffness) or args.stiffness <= 0:
