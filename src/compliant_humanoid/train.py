@@ -33,7 +33,7 @@ def train(args):
     )
     scene.add_entity(gs.morphs.Plane())
     robot = scene.add_entity(gs.morphs.MJCF(file=str(XML), align=False))
-    scene.build()
+    scene.build(n_envs=args.num_envs if args.num_envs > 1 else 0)
     model = mj.MjModel.from_xml_path(str(XML))
     data = mj.MjData(model)
     joints = [robot.get_joint(model.joint(i).name) for i in range(1, model.njnt)]
@@ -60,6 +60,11 @@ def train(args):
     if args.init:
         net.load_state_dict(torch.load(args.init, weights_only=True, map_location=gs.device))
 
+
+    if args.num_envs > 1:
+        from .batch_train import train_batch
+        return train_batch(args, scene, robot, model, indices, coords, wrist, foot_links, clip,
+                           features, net, optimizer, soft_lower, soft_upper)
 
     def optimize(records, bootstrap, terminal):
         obs, act, logp, values, rewards, wrench, balance = zip(*records)
@@ -194,7 +199,13 @@ def main():
     p.add_argument("--lr", type=float, default=0.001)
     p.add_argument("--force", type=float, default=5., help="Per-axis wrist load bound in N; 0 disables loads")
     p.add_argument("--init", help="Initialize weights from an earlier training stage")
-    train(p.parse_args())
+    p.add_argument("--num-envs", type=int, default=1)
+    p.add_argument("--batch-cap", type=int, default=24576, help="Maximum parallel PPO minibatch size")
+    p.add_argument("--load-cases", type=int, default=8, help="Number of precomputed force/stiffness trajectories")
+    args = p.parse_args()
+    if min(args.num_envs, args.load_cases, args.batch_cap, args.iterations) < 1:
+        p.error("Environment, load case, minibatch and iteration counts must be positive")
+    train(args)
 
 
 if __name__ == '__main__':
