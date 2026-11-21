@@ -52,7 +52,14 @@ def run(args):
     stiffness = tensor(np.full((1, 10, 1), np.log(args.stiffness)))
     with open(args.csv, "w", newline="") as stream:
         writer = csv.writer(stream)
-        writer.writerow("time_s fx_N fy_N fz_N link_x_m link_y_m link_z_m root_z_m fallen".split())
+        fields = "time_s fx_N fy_N fz_N link_x_m link_y_m link_z_m root_z_m fallen".split()
+        if args.diagnostics:
+            legs = [(i, j.name.removesuffix("_joint")) for i, j in enumerate(joints)
+                    if any(part in j.name for part in ("hip_", "knee_", "ankle_"))]
+            feet = [robot.get_link(f"{side}_ankle_roll_link").idx_local for side in ("left", "right")]
+            fields += ["pelvis_roll_deg", "pelvis_pitch_deg", "left_foot_fz_N", "right_foot_fz_N"]
+            fields += [f"{name}_{kind}_rad" for _, name in legs for kind in ("ref", "target", "actual")]
+        writer.writerow(fields)
         for frame in range(min(len(clip), int(np.ceil(50*args.seconds)))):
             t = frame/50
             rotation = Rotation.from_quat(robot.get_quat().cpu().numpy()[[1, 2, 3, 0]]).inv()
@@ -72,7 +79,17 @@ def run(args):
                 scene.step()
             height = robot.get_pos()[2].item()
             fallen = height < .35
-            writer.writerow(((frame+1)/50, *force, *link.get_pos().cpu().tolist(), height, int(fallen)))
+            row = [(frame+1)/50, *force, *link.get_pos().cpu().tolist(), height, int(fallen)]
+            if args.diagnostics:
+                quat = robot.get_quat().cpu().numpy()[[1, 2, 3, 0]]
+                roll, pitch, _ = Rotation.from_quat(quat).as_euler("xyz", degrees=True)
+                foot_fz = robot.get_links_net_contact_force()[feet, 2].cpu().tolist()
+                actual = robot.get_dofs_position(indices).cpu().tolist()
+                command = target.cpu().tolist()
+                row.extend((roll, pitch, *foot_fz))
+                for i, _ in legs:
+                    row.extend((clip[frame, 7+i], command[i], actual[i]))
+            writer.writerow(row)
             if fallen:
                 break
     print(f"{args.csv}: {(frame+1)/50:.2f} s, fallen={fallen}, root_z={height:.3f} m")
@@ -85,6 +102,7 @@ def main():
     mode.add_argument("--pd", action="store_true", help="Track reference joint angles directly")
     p.add_argument("--clip", default=CLIP)
     p.add_argument("--device", choices=["cpu", "cuda"], default="cuda")
+    p.add_argument("--diagnostics", action="store_true", help="Log leg angles, pelvis tilt and vertical foot contact forces")
     p.add_argument("--viewer", action="store_true")
     p.add_argument("--link", default="left_wrist_yaw_link")
     p.add_argument("--force", nargs=3, type=float, default=[5, 0, 0])
