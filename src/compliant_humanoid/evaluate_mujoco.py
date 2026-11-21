@@ -52,6 +52,9 @@ def run(args):
     clip, reference = load_clip(args.clip, model)
     reference = torch.as_tensor(reference, dtype=torch.float32)
     wrist = model.body('left_wrist_yaw_link').id
+    arm_ids = [i for i in range(model.nu) if model.joint(i+1).name.startswith(
+        ("left_shoulder_", "left_elbow_", "left_wrist_"))]
+    limits = model.jnt_range[np.asarray(arm_ids)+1]
     events = SimpleQueue()
     if args.headless:
         window = nullcontext(None)
@@ -66,16 +69,27 @@ def run(args):
         elapsed = 0
         stiffness = args.stiffness
         pulse = 0
+        mode = "play"
+        arm_history = None
         while view is None or view.is_running():
             start = time.perf_counter()
             while not events.empty():
                 key = events.get()
                 if key == ord("R"):
                     reset = True
+                elif key == ord("T") and not reset:
+                    mode = "hold" if mode == "teach" else "teach"
+                    arm_target = torch.tensor(np.clip(data.qpos[7:][arm_ids], *limits.T),
+                                              dtype=torch.float32)
+                    if mode == "teach":
+                        stiffness = 50.
+                    else:
+                        stiffness_goal = 400.
                 elif key == ord("F"):
                     pulse = 25
                 elif key in (ord("1"), ord("2"), 321, 322):
                     stiffness = 100. if key in (ord("1"), 321) else 400.
+                    stiffness_goal = stiffness
                     print(f"stiffness={stiffness:g} N/m", flush=True)
             if reset:
                 mj.mj_resetData(model, data)
@@ -86,6 +100,10 @@ def run(args):
                 history = None
                 pulse = 0
                 frame = 0
+                if mode != "play":
+                    stiffness = args.stiffness
+                mode = "play"
+                arm_history = None
                 reset = False
             orientation = Rotation.from_quat(data.qpos[[4, 5, 6, 3]])
             # Floating-joint angular velocity is already in the local body frame.
@@ -95,6 +113,19 @@ def run(args):
             history = prop.repeat(10, 1) if history is None else torch.cat((history[1:], prop[None]))
             past = reference[np.maximum(0, frame + np.arange(-9, 1))]
             future = reference[np.minimum(len(clip)-1, frame + 2*np.arange(5))]
+            if mode != "play":
+                if arm_history is None:
+                    arm_history = past[:, arm_ids].clone()
+                if mode == "teach":
+                    arm_target = torch.tensor(np.clip(data.qpos[7:][arm_ids], *limits.T),
+                                              dtype=torch.float32)
+                arm_history = torch.cat((arm_history[1:], arm_target[None]))
+                past[:, arm_ids] = arm_history
+                future[:, arm_ids] = arm_target
+                if mode == "hold":
+                    # Blend the command in log space over successive control ticks.
+                    stiffness = float(np.exp(.9*np.log(last_stiffness) + .1*np.log(stiffness_goal)))
+            last_stiffness = stiffness
             dist, _, _, _ = policy(history[None], past[None],
                                     torch.full((1, 10, 1), float(np.log(stiffness))), future[None])
             previous = dist.mean[0]
@@ -103,8 +134,8 @@ def run(args):
                 pulse = 25
             if view:
                 view.set_texts((mj.mjtFontScale.mjFONTSCALE_100, mj.mjtGridPos.mjGRID_TOPRIGHT,
-                                "Stiffness command (N/m)\nLeft wrist test force (N)",
-                                f"{stiffness:g}\n{5 if pulse else 0}"))
+                                "Stiffness command (N/m)\nLeft wrist test force (N)\nLeft arm [T]",
+                                f"{stiffness:.0f}\n{5 if pulse else 0}\n{mode}"))
                 view.sync()
             if pulse:
                 data.xfrc_applied[wrist, 0] += 5
