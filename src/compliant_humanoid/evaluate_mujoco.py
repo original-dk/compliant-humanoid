@@ -52,15 +52,13 @@ def run(args):
     clip, reference = load_clip(args.clip, model)
     reference = torch.as_tensor(reference, dtype=torch.float32)
     wrist = model.body('left_wrist_yaw_link').id
-    arm_ids = [i for i in range(model.nu) if model.joint(i+1).name.startswith(
-        ("left_shoulder_", "left_elbow_", "left_wrist_"))]
-    limits = model.jnt_range[np.asarray(arm_ids)+1]
+    feet = [model.body(side + "_ankle_roll_link").id for side in ("left", "right")]
     events = SimpleQueue()
     if args.headless:
         window = nullcontext(None)
     else:
-        from .drag_viewer import DragViewer
-        window = DragViewer(model, data, events.put)
+        import mujoco.viewer as viewer
+        window = viewer.launch_passive(model, data, key_callback=events.put)
     with window as view:
         if view:
             view.cam.lookat[:] = [0, 0, .8]
@@ -69,8 +67,6 @@ def run(args):
         elapsed = 0
         stiffness = args.stiffness
         pulse = 0
-        mode = "play"
-        arm_history = None
         while view is None or view.is_running():
             start = time.perf_counter()
             while not events.empty():
@@ -81,7 +77,6 @@ def run(args):
                     pulse = 25
                 elif key in (ord("1"), ord("2"), 321, 322):
                     stiffness = 100. if key in (ord("1"), 321) else 400.
-                    stiffness_goal = stiffness
                     print(f"stiffness={stiffness:g} N/m", flush=True)
             if reset:
                 mj.mj_resetData(model, data)
@@ -92,42 +87,33 @@ def run(args):
                 history = None
                 pulse = 0
                 frame = 0
-                if mode != "play":
-                    stiffness = args.stiffness
-                mode = "play"
-                arm_history = None
+                live_history = None
                 reset = False
             if view:
                 view.sync()
-                if view.perturb.active and mode != "teach":
-                    mode = "teach"
-                    stiffness = 50.
-                elif not view.perturb.active and mode == "teach":
-                    mode = "hold"
-                    arm_target = torch.tensor(np.clip(data.qpos[7:][arm_ids], *limits.T),
-                                              dtype=torch.float32)
-                    stiffness_goal = 400.
             orientation = Rotation.from_quat(data.qpos[[4, 5, 6, 3]])
             # Floating-joint angular velocity is already in the local body frame.
             prop = torch.cat((torch.tensor(np.r_[data.qvel[3:6],
                               orientation.inv().apply([0, 0, -1]), data.qpos[7:], data.qvel[6:]],
                               dtype=torch.float32), previous))
             history = prop.repeat(10, 1) if history is None else torch.cat((history[1:], prop[None]))
-            past = reference[np.maximum(0, frame + np.arange(-9, 1))]
-            future = reference[np.minimum(len(clip)-1, frame + 2*np.arange(5))]
-            if mode != "play":
-                if arm_history is None:
-                    arm_history = past[:, arm_ids].clone()
-                if mode == "teach":
-                    arm_target = torch.tensor(np.clip(data.qpos[7:][arm_ids], *limits.T),
-                                              dtype=torch.float32)
-                arm_history = torch.cat((arm_history[1:], arm_target[None]))
-                past[:, arm_ids] = arm_history
-                future[:, arm_ids] = arm_target
-                if mode == "hold":
-                    # Blend the command in log space over successive control ticks.
-                    stiffness = float(np.exp(.9*np.log(last_stiffness) + .1*np.log(stiffness_goal)))
-            last_stiffness = stiffness
+            if args.reference == "live":
+                body_vel = orientation.inv().apply(data.qvel[:3])
+                # Match the clip encoder's intrinsic z-y-x yaw derivative.
+                epsilon = 1e-5
+                next_rot = orientation * Rotation.from_rotvec(data.qvel[3:6] * epsilon)
+                yaw_delta = next_rot.as_euler("zyx")[0] - orientation.as_euler("zyx")[0]
+                yaw_rate = np.arctan2(np.sin(yaw_delta), np.cos(yaw_delta)) / epsilon
+                mj.mj_kinematics(model, data)
+                cmd = torch.tensor(np.r_[data.qpos[7:], body_vel[:2], yaw_rate, data.qpos[2],
+                                         orientation.inv().apply([0., 0., -1.]),
+                                         data.xpos[feet, 2] < .09], dtype=torch.float32)
+                live_history = (cmd.repeat(10, 1) if live_history is None else
+                                torch.cat((live_history[1:], cmd[None])))
+                past, future = live_history, cmd.repeat(5, 1)
+            else:
+                past = reference[np.maximum(0, frame + np.arange(-9, 1))]
+                future = reference[np.minimum(len(clip)-1, frame + 2*np.arange(5))]
             dist, _, _, _ = policy(history[None], past[None],
                                     torch.full((1, 10, 1), float(np.log(stiffness))), future[None])
             previous = dist.mean[0]
@@ -136,8 +122,8 @@ def run(args):
                 pulse = 25
             if view:
                 view.set_texts((mj.mjtFontScale.mjFONTSCALE_100, mj.mjtGridPos.mjGRID_TOPRIGHT,
-                                "Stiffness command (N/m)\nLeft wrist test force (N)\nLeft arm [drag]",
-                                f"{stiffness:.0f}\n{5 if pulse else 0}\n{mode}"))
+                                "Stiffness command (N/m)\nLeft wrist test force (N)\nReference source",
+                                f"{stiffness:.0f}\n{5 if pulse else 0}\n{args.reference}"))
             if pulse:
                 data.xfrc_applied[wrist, 0] += 5
             if not np.isfinite(data.ctrl).all():
@@ -171,7 +157,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--policy", type=Path, required=True)
     p.add_argument("--clip", default=CLIP)
-    p.add_argument("--stiffness", type=float, default=100.)
+    p.add_argument("--reference", choices=("live", "clip"), default="live")
+    p.add_argument("--stiffness", type=float, default=50.)
     p.add_argument("--headless", action="store_true")
     p.add_argument("--test-pull", action="store_true", help="Apply +5 N at left wrist from 1 to 1.5 s")
     p.add_argument("--seconds", type=float, help="Stop after this many simulated seconds")
